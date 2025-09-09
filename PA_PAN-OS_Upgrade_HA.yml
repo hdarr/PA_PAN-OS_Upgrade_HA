@@ -1,0 +1,656 @@
+---
+- name: PA_PAN-OS_Upgrade_HA
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  
+  vars_prompt:
+    - name: panos_ip_primary
+      prompt: "Enter the IP address of the PRIMARY firewall"
+      private: false
+      
+    - name: panos_ip_secondary
+      prompt: "Enter the IP address of the SECONDARY firewall"
+      private: false
+      
+    - name: panos_port_primary
+      prompt: "Enter the API port for PRIMARY firewall (default: 443)"
+      private: false
+      default: "443"
+      
+    - name: panos_port_secondary
+      prompt: "Enter the API port for SECONDARY firewall (default: 443)"
+      private: false
+      default: "443"
+      
+    - name: panos_username
+      prompt: "Enter the firewall username"
+      private: false
+      
+    - name: panos_password
+      prompt: "Enter the firewall password"
+      private: true
+      
+    - name: target_version
+      prompt: "Enter the target PAN-OS version (e.g., 11.1.0)"
+      private: false
+      
+    - name: dry_run_input
+      prompt: "Run in dry-run mode? (y/n)"
+      private: false
+      default: "y"
+
+  vars:
+    dry_run: "{{ dry_run_input.lower() == 'y' or dry_run_input.lower() == 'yes' }}"
+    reboot_timeout: 1800
+    upgrade_timeout: 3600
+    
+  tasks:
+    - name: PAN-OS HA Upgrade Prerequisites and Requirements
+      debug:
+        msg: |
+          ==========================================
+          PAN-OS HA UPGRADE PREREQUISITES
+          ==========================================
+          Before proceeding, ensure you have:
+          
+          1. PRIMARY FIREWALL IP ADDRESS
+             - Management IP of the primary firewall
+          
+          2. SECONDARY FIREWALL IP ADDRESS  
+             - Management IP of the secondary firewall
+          
+          3. ADMIN CREDENTIALS
+             - Username with administrative privileges
+             - Password for the admin account
+             - Custom API ports if not using default (443)
+          
+          4. TARGET VERSION
+             - Desired PAN-OS version (e.g., 11.1.0)
+             - Ensure version is compatible with your hardware
+          
+          5. NETWORK REQUIREMENTS
+             - Management network connectivity to both firewalls
+             - Internet access for software/content downloads
+             - Sufficient disk space on both firewalls
+          
+          6. MAINTENANCE WINDOW
+             - Estimated time: 45-90 minutes depending on hardware
+             - Both firewalls will reboot during this process
+             - Brief traffic interruption during failover
+          
+          ==========================================
+          ⚠️  CRITICAL: BACKUP REQUIREMENT ⚠️
+          ==========================================
+          
+          MANDATORY: Create complete backups before proceeding!
+          
+          Required backups for BOTH firewalls:
+          • Full configuration backup (Device > Setup > Operations > Export)
+          • Current running configuration
+          • Certificate and key backups if using custom certificates
+          • Document current software and content versions
+          
+          Backup verification:
+          • Test backup file integrity
+          • Store backups in secure, accessible location
+          • Verify you can restore from backup if needed
+          
+          ⚠️  DO NOT PROCEED WITHOUT VALID BACKUPS! ⚠️
+          
+          In case of upgrade failure, backups are your only
+          recovery method to restore service quickly.
+          
+          ==========================================
+
+    - name: Display configuration summary
+      debug:
+        msg: |
+          ==========================================
+          CONFIGURATION SUMMARY
+          ==========================================
+          Primary Firewall IP: {{ panos_ip_primary }}:{{ panos_port_primary }}
+          Secondary Firewall IP: {{ panos_ip_secondary }}:{{ panos_port_secondary }}
+          Username: {{ panos_username }}
+          Target Version: {{ target_version }}
+          Dry Run Mode: {{ dry_run }}
+          ==========================================
+
+    - name: Confirm before proceeding
+      pause:
+        prompt: "Press ENTER to continue or Ctrl+C to abort"
+
+    - name: Get HA status from primary firewall
+      paloaltonetworks.panos.panos_op:
+        ip_address: "{{ panos_ip_primary }}"
+        port: "{{ panos_port_primary }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        cmd: "show high-availability state"
+      register: ha_status_primary
+      tags: [pre_check]
+
+    - name: Parse HA status from JSON output
+      set_fact:
+        ha_json: "{{ ha_status_primary.stdout | from_json }}"
+      tags: [pre_check]
+
+    - name: Extract HA states from JSON
+      set_fact:
+        primary_ha_state: "{{ ha_json.response.result.group['local-info'].state }}"
+        secondary_ha_state: "{{ ha_json.response.result.group['peer-info'].state }}"
+        ha_enabled: "{{ ha_json.response.result.enabled == 'yes' }}"
+        ha_mode: "{{ ha_json.response.result.group.mode }}"
+      tags: [pre_check]
+
+    - name: Display current HA status
+      debug:
+        msg: |
+          ==========================================
+          HA STATUS
+          ==========================================
+          HA Enabled: {{ ha_enabled }}
+          HA Mode: {{ ha_mode }}
+          Primary firewall ({{ panos_ip_primary }}:{{ panos_port_primary }}) state: {{ primary_ha_state }}
+          Secondary firewall ({{ panos_ip_secondary }}:{{ panos_port_secondary }}) state: {{ secondary_ha_state }}
+          ==========================================
+      tags: [pre_check]
+
+    - name: Verify HA is functional
+      assert:
+        that:
+          - primary_ha_state in ['active', 'passive']
+          - secondary_ha_state in ['active', 'passive']
+          - primary_ha_state != secondary_ha_state
+          - ha_enabled
+        fail_msg: |
+          HA is not in a healthy state. 
+          Primary: {{ primary_ha_state }}, Secondary: {{ secondary_ha_state }}
+          HA Enabled: {{ ha_enabled }}
+          
+          Expected states: one 'active' and one 'passive'
+          Please check HA configuration and ensure both firewalls are properly configured.
+      tags: [pre_check]
+
+    - name: Determine active and passive firewalls
+      set_fact:
+        active_fw: "{{ panos_ip_primary if primary_ha_state == 'active' else panos_ip_secondary }}"
+        passive_fw: "{{ panos_ip_secondary if primary_ha_state == 'active' else panos_ip_primary }}"
+        active_fw_port: "{{ panos_port_primary if primary_ha_state == 'active' else panos_port_secondary }}"
+        passive_fw_port: "{{ panos_port_secondary if primary_ha_state == 'active' else panos_port_primary }}"
+      tags: [pre_check]
+
+    - name: Display upgrade order
+      debug:
+        msg: |
+          Active firewall: {{ active_fw }}:{{ active_fw_port }}
+          Passive firewall: {{ passive_fw }}:{{ passive_fw_port }}
+          Upgrade order: Passive first ({{ passive_fw }}:{{ passive_fw_port }}), then Active ({{ active_fw }}:{{ active_fw_port }})
+      tags: [pre_check]
+
+    - name: Get current software version from both firewalls
+      paloaltonetworks.panos.panos_op:
+        ip_address: "{{ item.ip }}"
+        port: "{{ item.port }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        cmd: "show system info"
+      register: system_info
+      loop:
+        - { ip: "{{ active_fw }}", port: "{{ active_fw_port }}" }
+        - { ip: "{{ passive_fw }}", port: "{{ passive_fw_port }}" }
+      tags: [pre_check]
+
+    - name: Parse current versions from JSON
+      set_fact:
+        current_versions: "{{ current_versions | default({}) | combine({item.item.ip: (item.stdout | from_json).response.result.system['sw-version']}) }}"
+      loop: "{{ system_info.results }}"
+      tags: [pre_check]
+
+    - name: Display current versions
+      debug:
+        msg: |
+          Current versions:
+          Active FW ({{ active_fw }}:{{ active_fw_port }}): {{ current_versions[active_fw] }}
+          Passive FW ({{ passive_fw }}:{{ passive_fw_port }}): {{ current_versions[passive_fw] }}
+          Target version: {{ target_version }}
+      tags: [pre_check]
+
+    - name: Check if upgrade is needed
+      set_fact:
+        upgrade_needed: "{{ current_versions[active_fw] != target_version or current_versions[passive_fw] != target_version }}"
+      tags: [pre_check]
+
+    - name: Skip upgrade if not needed
+      debug:
+        msg: "Both firewalls are already running target version {{ target_version }}. Skipping upgrade."
+      when: not upgrade_needed
+      tags: [pre_check]
+
+    - name: End play if no upgrade needed
+      meta: end_play
+      when: not upgrade_needed
+
+    # Content Update Phase: Update content databases before PAN-OS upgrade
+    - name: "Content Update: Check current content versions"
+      paloaltonetworks.panos.panos_op:
+        ip_address: "{{ item.ip }}"
+        port: "{{ item.port }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        cmd: "show system info"
+      register: content_info
+      loop:
+        - { ip: "{{ active_fw }}", port: "{{ active_fw_port }}" }
+        - { ip: "{{ passive_fw }}", port: "{{ passive_fw_port }}" }
+      when: upgrade_needed
+      tags: [content, pre_upgrade]
+
+    - name: "Content Update: Parse current content versions"
+      set_fact:
+        current_content_versions: "{{ current_content_versions | default({}) | combine({item.item.ip: (item.stdout | from_json).response.result.system['app-version']}) }}"
+      loop: "{{ content_info.results }}"
+      when: upgrade_needed
+      tags: [content, pre_upgrade]
+
+    - name: "Content Update: Check for available content updates on active firewall"
+      paloaltonetworks.panos.panos_op:
+        ip_address: "{{ active_fw }}"
+        port: "{{ active_fw_port }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        cmd: "request content upgrade check"
+      register: content_check
+      when: upgrade_needed
+      tags: [content, check]
+
+    - name: "Content Update: Parse content check results"
+      set_fact:
+        content_check_json: "{{ content_check.stdout | from_json }}"
+      when: upgrade_needed and content_check.stdout is defined
+      tags: [content, check]
+
+    - name: "Content Update: Determine if content update is needed"
+      set_fact:
+        content_update_needed: "{{ content_check_json.response.result['content-updates'].entry | selectattr('current', 'equalto', 'yes') | list | length == 0 }}"
+        latest_content_version: "{{ (content_check_json.response.result['content-updates'].entry | sort(attribute='version') | last).version }}"
+      when: upgrade_needed and content_check.stdout is defined
+      tags: [content, check]
+
+    - name: "Content Update: Display content status"
+      debug:
+        msg: |
+          Current content versions:
+          Active FW ({{ active_fw }}:{{ active_fw_port }}): {{ current_content_versions[active_fw] }}
+          Passive FW ({{ passive_fw }}:{{ passive_fw_port }}): {{ current_content_versions[passive_fw] }}
+          Latest available: {{ latest_content_version | default('Unknown') }}
+          Update needed: {{ content_update_needed | default(true) }}
+      when: upgrade_needed
+      tags: [content, check]
+
+    - name: "Content Update: Skip if already latest"
+      debug:
+        msg: |
+          ==========================================
+          CONTENT UPDATE SKIPPED
+          ==========================================
+          Latest content ({{ latest_content_version }}) is already installed.
+          Both firewalls have current content versions.
+          Proceeding with PAN-OS upgrade...
+          ==========================================
+      when: upgrade_needed and not (content_update_needed | default(true))
+      tags: [content, skip]
+
+    - name: "Content Update: Download and install on active firewall only"
+      block:
+        - name: "Content Update: Download latest content to active firewall"
+          paloaltonetworks.panos.panos_op:
+            ip_address: "{{ active_fw }}"
+            port: "{{ active_fw_port }}"
+            username: "{{ panos_username }}"
+            password: "{{ panos_password }}"
+            cmd: "request content upgrade download latest"
+          register: active_content_download
+
+        - name: "Content Update: Wait for content download (5 minutes)"
+          pause:
+            seconds: 300
+            prompt: "Waiting for content download on active firewall..."
+
+        - name: "Content Update: Install content on active firewall"
+          paloaltonetworks.panos.panos_op:
+            ip_address: "{{ active_fw }}"
+            port: "{{ active_fw_port }}"
+            username: "{{ panos_username }}"
+            password: "{{ panos_password }}"
+            cmd: "request content upgrade install"
+
+        - name: "Content Update: Wait for content installation (3 minutes)"
+          pause:
+            seconds: 180
+            prompt: "Waiting for content installation on active firewall..."
+
+        - name: "Content Update: Wait for HA sync (2 minutes)"
+          pause:
+            seconds: 120
+            prompt: "Waiting for content to sync to passive firewall via HA..."
+
+        - name: "Content Update: Verify content sync to passive firewall"
+          paloaltonetworks.panos.panos_op:
+            ip_address: "{{ passive_fw }}"
+            port: "{{ passive_fw_port }}"
+            username: "{{ panos_username }}"
+            password: "{{ panos_password }}"
+            cmd: "show system info"
+          register: passive_content_verify
+          retries: 3
+          delay: 60
+
+        - name: "Content Update: Parse passive content version"
+          set_fact:
+            passive_content_version: "{{ (passive_content_verify.stdout | from_json).response.result.system['app-version'] }}"
+
+        - name: "Content Update: Verify content versions match"
+          debug:
+            msg: |
+              Content update completed:
+              Active FW: {{ latest_content_version }}
+              Passive FW: {{ passive_content_version }}
+              Sync status: {{ 'Success' if passive_content_version == latest_content_version else 'Pending - will retry' }}
+
+      when: upgrade_needed and not dry_run and (content_update_needed | default(true))
+      tags: [content, update]
+
+    # Phase 1: Upgrade Passive Firewall
+    - name: "Phase 1: Download software to passive firewall"
+      paloaltonetworks.panos.panos_software:
+        ip_address: "{{ passive_fw }}"
+        port: "{{ passive_fw_port }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        version: "{{ target_version }}"
+        download: true
+        install: false
+        restart: false
+      register: passive_download
+      when: upgrade_needed and not dry_run
+      tags: [phase1, download]
+
+    - name: "Phase 1: Install software on passive firewall"
+      paloaltonetworks.panos.panos_software:
+        ip_address: "{{ passive_fw }}"
+        port: "{{ passive_fw_port }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        version: "{{ target_version }}"
+        download: false
+        install: true
+        restart: true
+      register: passive_install
+      when: upgrade_needed and not dry_run
+      tags: [phase1, install]
+
+    - name: "Phase 1: Wait for passive firewall to reboot and become ready"
+      paloaltonetworks.panos.panos_check:
+        ip_address: "{{ passive_fw }}"
+        port: "{{ passive_fw_port }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        timeout: "{{ reboot_timeout }}"
+      when: upgrade_needed and not dry_run
+      tags: [phase1, wait]
+
+    - name: "Phase 1: Additional wait for passive firewall API readiness"
+      pause:
+        seconds: 350
+        prompt: "Waiting additional time for passive firewall API to be ready..."
+      when: upgrade_needed and not dry_run
+      tags: [phase1, wait]
+
+    - name: "Phase 1: Verify passive firewall is running target version"
+      paloaltonetworks.panos.panos_op:
+        ip_address: "{{ passive_fw }}"
+        port: "{{ passive_fw_port }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        cmd: "show system info"
+      register: passive_version_check
+      when: upgrade_needed and not dry_run
+      tags: [phase1, verify]
+
+    - name: "Phase 1: Parse and verify passive firewall version"
+      set_fact:
+        passive_new_version: "{{ (passive_version_check.stdout | from_json).response.result.system['sw-version'] }}"
+      when: upgrade_needed and not dry_run
+      tags: [phase1, verify]
+
+    - name: "Phase 1: Assert passive firewall upgrade successful"
+      assert:
+        that:
+          - passive_new_version == target_version
+        fail_msg: "Passive firewall upgrade failed. Expected: {{ target_version }}, Got: {{ passive_new_version }}"
+      when: upgrade_needed and not dry_run
+      tags: [phase1, verify]
+
+    # Phase 2: Failover and Upgrade Active Firewall
+    - name: "Phase 2: Initiate manual failover"
+      paloaltonetworks.panos.panos_op:
+        ip_address: "{{ active_fw }}"
+        port: "{{ active_fw_port }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        cmd: "request high-availability state suspend"
+      when: upgrade_needed and not dry_run
+      tags: [phase2, failover]
+
+    - name: "Phase 2: Wait for failover to complete"
+      pause:
+        seconds: 30
+        prompt: "Waiting for failover to complete..."
+      when: upgrade_needed and not dry_run
+      tags: [phase2, failover]
+
+    - name: "Phase 2: Verify failover completed"
+      paloaltonetworks.panos.panos_op:
+        ip_address: "{{ passive_fw }}"
+        port: "{{ passive_fw_port }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        cmd: "show high-availability state"
+      register: failover_status
+      when: upgrade_needed and not dry_run
+      tags: [phase2, verify_failover]
+
+    - name: "Phase 2: Parse new HA states"
+      set_fact:
+        failover_json: "{{ failover_status.stdout | from_json }}"
+        new_passive_state: "{{ (failover_status.stdout | from_json).response.result.group['local-info'].state }}"
+      when: upgrade_needed and not dry_run
+      tags: [phase2, verify_failover]
+
+    - name: "Phase 2: Verify failover successful"
+      assert:
+        that:
+          - new_passive_state == 'active'
+        fail_msg: "Failover failed. Expected previously passive firewall to be active, but state is: {{ new_passive_state }}"
+      when: upgrade_needed and not dry_run
+      tags: [phase2, verify_failover]
+
+    - name: "Phase 2: Check if software already downloaded on now-passive firewall"
+      paloaltonetworks.panos.panos_op:
+        ip_address: "{{ active_fw }}"
+        port: "{{ active_fw_port }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        cmd: "show system software status"
+      register: software_status
+      when: upgrade_needed and not dry_run
+      tags: [phase2, check]
+
+    - name: "Phase 2: Parse software status"
+      set_fact:
+        software_downloaded: "{{ target_version in software_status.stdout }}"
+      when: upgrade_needed and not dry_run
+      tags: [phase2, check]
+
+    - name: "Phase 2: Download software to now-passive firewall (if needed)"
+      paloaltonetworks.panos.panos_software:
+        ip_address: "{{ active_fw }}"
+        port: "{{ active_fw_port }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        version: "{{ target_version }}"
+        download: true
+        install: false
+        restart: false
+      when: upgrade_needed and not dry_run and not software_downloaded
+      tags: [phase2, download]
+
+    - name: "Phase 2: Skip download - software already available"
+      debug:
+        msg: "Software version {{ target_version }} already downloaded on firewall. Proceeding to installation."
+      when: upgrade_needed and not dry_run and software_downloaded
+      tags: [phase2, skip]
+
+    - name: "Phase 2: Install software on now-passive firewall (original active)"
+      paloaltonetworks.panos.panos_software:
+        ip_address: "{{ active_fw }}"
+        port: "{{ active_fw_port }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        version: "{{ target_version }}"
+        download: false
+        install: true
+        restart: true
+      when: upgrade_needed and not dry_run
+      tags: [phase2, install]
+
+    - name: "Phase 2: Wait for original active firewall to reboot and become ready"
+      paloaltonetworks.panos.panos_check:
+        ip_address: "{{ active_fw }}"
+        port: "{{ active_fw_port }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        timeout: "{{ reboot_timeout }}"
+      when: upgrade_needed and not dry_run
+      tags: [phase2, wait]
+
+    - name: "Phase 2: Additional wait for active firewall API readiness"
+      pause:
+        seconds: 350
+        prompt: "Waiting additional time for active firewall API to be ready..."
+      when: upgrade_needed and not dry_run
+      tags: [phase2, wait]
+
+    - name: "Phase 2: Verify original active firewall is running target version"
+      paloaltonetworks.panos.panos_op:
+        ip_address: "{{ active_fw }}"
+        port: "{{ active_fw_port }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        cmd: "show system info"
+      register: active_version_check
+      when: upgrade_needed and not dry_run
+      tags: [phase2, verify]
+
+    - name: "Phase 2: Parse and verify original active firewall version"
+      set_fact:
+        active_new_version: "{{ (active_version_check.stdout | from_json).response.result.system['sw-version'] }}"
+      when: upgrade_needed and not dry_run
+      tags: [phase2, verify]
+
+    - name: "Phase 2: Assert original active firewall upgrade successful"
+      assert:
+        that:
+          - active_new_version == target_version
+        fail_msg: "Original active firewall upgrade failed. Expected: {{ target_version }}, Got: {{ active_new_version }}"
+      when: upgrade_needed and not dry_run
+      tags: [phase2, verify]
+
+    # Phase 3: Final HA Status Check
+    - name: "Phase 3: Resume HA on original active firewall"
+      paloaltonetworks.panos.panos_op:
+        ip_address: "{{ active_fw }}"
+        port: "{{ active_fw_port }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        cmd: "request high-availability state functional"
+      when: upgrade_needed and not dry_run
+      tags: [phase3, resume_ha]
+
+    - name: "Phase 3: Wait for HA synchronization"
+      pause:
+        seconds: 10
+        prompt: "Waiting for final HA synchronization..."
+      when: upgrade_needed and not dry_run
+      tags: [phase3, sync]
+
+    - name: "Phase 3: Final HA status check"
+      paloaltonetworks.panos.panos_op:
+        ip_address: "{{ item.ip }}"
+        port: "{{ item.port }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        cmd: "show high-availability state"
+      register: final_ha_status
+      loop:
+        - { ip: "{{ panos_ip_primary }}", port: "{{ panos_port_primary }}" }
+        - { ip: "{{ panos_ip_secondary }}", port: "{{ panos_port_secondary }}" }
+      when: upgrade_needed and not dry_run
+      tags: [phase3, final_check]
+
+    - name: "Phase 3: Final version verification"
+      paloaltonetworks.panos.panos_op:
+        ip_address: "{{ item.ip }}"
+        port: "{{ item.port }}"
+        username: "{{ panos_username }}"
+        password: "{{ panos_password }}"
+        cmd: "show system info"
+      register: final_version_check
+      loop:
+        - { ip: "{{ panos_ip_primary }}", port: "{{ panos_port_primary }}" }
+        - { ip: "{{ panos_ip_secondary }}", port: "{{ panos_port_secondary }}" }
+      when: upgrade_needed and not dry_run
+      tags: [phase3, final_check]
+
+    - name: "Phase 3: Parse final versions"
+      set_fact:
+        final_versions: "{{ final_versions | default({}) | combine({item.item.ip: (item.stdout | from_json).response.result.system['sw-version']}) }}"
+      loop: "{{ final_version_check.results }}"
+      when: upgrade_needed and not dry_run
+      tags: [phase3, final_check]
+
+    - name: "Upgrade Complete: Display final status"
+      debug:
+        msg: |
+          ==========================================
+          PALO ALTO HA UPGRADE COMPLETED SUCCESSFULLY
+          ==========================================
+          Target Version: {{ target_version }}
+          Primary FW ({{ panos_ip_primary }}:{{ panos_port_primary }}): {{ final_versions[panos_ip_primary] }}
+          Secondary FW ({{ panos_ip_secondary }}:{{ panos_port_secondary }}): {{ final_versions[panos_ip_secondary] }}
+          
+          Both firewalls are now running the target version and HA is restored.
+          ==========================================
+      when: upgrade_needed and not dry_run
+      tags: [complete]
+
+    - name: "Dry Run: Display what would be done"
+      debug:
+        msg: |
+          ==========================================
+          DRY RUN MODE - NO CHANGES MADE
+          ==========================================
+          Would upgrade the following firewalls:
+          - Passive FW ({{ passive_fw }}:{{ passive_fw_port }}): {{ current_versions[passive_fw] }} → {{ target_version }}
+          - Active FW ({{ active_fw }}:{{ active_fw_port }}): {{ current_versions[active_fw] }} → {{ target_version }}
+          
+          Upgrade process would be:
+          1. Update content databases on active firewall (with HA sync)
+          2. Upgrade passive firewall and reboot
+          3. Initiate failover
+          4. Upgrade original active firewall and reboot
+          5. Resume HA functionality
+          ==========================================
+      when: upgrade_needed and dry_run
+      tags: [dry_run]
