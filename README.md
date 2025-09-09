@@ -97,7 +97,7 @@ ping <primary_firewall_ip>
 ping <secondary_firewall_ip>
 
 # Test API connectivity
-curl -k https://<firewall_ip>/api/?type=keygen&user=<username>&password=<password>
+curl -k https://<firewall_ip><:8443>/api/?type=keygen&user=<username>&password=<password>
 ```
 
 ## Usage
