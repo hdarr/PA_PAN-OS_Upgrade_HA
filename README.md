@@ -97,7 +97,7 @@ ping <primary_firewall_ip>
 ping <secondary_firewall_ip>
 
 # Test API connectivity
-curl -k https://<firewall_ip><:8443>/api/?type=keygen&user=<username>&password=<password>
+curl -k -X POST "https://<firewall_ip>:<custom_port>/api/" -d "type=keygen&user=<your_username>&password=<your_password>"
 ```
 
 ## Usage
@@ -186,14 +186,17 @@ All operations are logged with detailed status information, making troubleshooti
 
 #### Connection Problems
 ```bash
-# Test API connectivity (default port)
-curl -k -X GET "https://<firewall-ip>/api/?type=keygen&user=<username>&password=<password>"
+# Test API authentication (use POST method)
+curl -k -X POST "https://<firewall-ip>/api/" \
+  -d "type=keygen&user=<username>&password=<password>"
 
-# Test API connectivity with custom port
-curl -k -X GET "https://<firewall-ip>:<custom_port>/api/?type=keygen&user=<username>&password=<password>"
+# Test API with custom port
+curl -k -X POST "https://<firewall-ip>:<custom_port>/api/" \
+  -d "type=keygen&user=<username>&password=<password>"
 
 # Example: Testing with custom port 8443
-curl -k -X GET "https://192.168.1.10:8443/api/?type=keygen&user=admin&password=yourpassword"
+curl -k -X POST "https://192.168.1.10:8443/api/" \
+  -d "type=keygen&user=admin&password=yourpassword"
 ```
 
 #### Collection Not Found
